@@ -20,13 +20,9 @@ import (
 	"fmt"
 	"sync"
 
-	// log "github.com/sirupsen/logrus"
-
 	"github.com/vimeo/groupcache"
 	"github.com/vimeo/groupcache/consistenthash"
-	"github.com/vimeo/groupcache/lru"
 	pb "github.com/vimeo/groupcache/groupcachepb"
-	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -50,11 +46,11 @@ type GRPCPoolOptions struct {
 	// defaults to crc32.ChecksumIEEE
 	HashFn consistenthash.Hash
 
-	// connection set up configuration (necessary?)
+	// connection set up configurations for all peers
 	PeerDialOptions []grpc.DialOption
 
 	// if true, there will be no TLS
-	IsInsecureConnection bool
+	AllInsecureConnections bool
 }
 
 // NOT SURE
@@ -62,6 +58,18 @@ type GRPCPoolOptions struct {
 type grpcGetter struct {
 	address string
 	conn    *grpc.ClientConn
+}
+
+// GOOD
+// NEW GETTER: starts up the connection, throwing an error if it can't be made
+func newGRPCGetter(address string, dialOpts ...grpc.DialOption) (*grpcGetter, error) {
+	conn, err := grpc.Dial(address, dialOpts...)
+	if err != nil {
+		fmt.Printf("Failure connecting: [%v]\n", err)
+		return nil, fmt.Errorf("Failed to connect to peer at [%s]: %v", address, err)
+	}
+	fmt.Printf("Success connecting to new Getter at [%s]\n", address)
+	return &grpcGetter{address: address, conn: conn}, nil
 }
 
 // GOOD
@@ -87,12 +95,12 @@ func NewGRPCOptions(self string, server *grpc.Server, opts *GRPCPoolOptions) *GR
 		pool.opts.Replicas = defaultReplicas
 	}
 
-	// old default:
-	// if pool.opts.PeerDialOptions == nil {
-	// 	pool.opts.PeerDialOptions = []grpc.DialOption{grpc.WithInsecure()}
-	// }
+	// old default: using it to test until I figure out how to set up the security
+	if pool.opts.PeerDialOptions == nil {
+		pool.opts.PeerDialOptions = []grpc.DialOption{grpc.WithInsecure()}
+	}
 
-	if pool.opts.IsInsecureConnection {
+	if pool.opts.AllInsecureConnections {
 		pool.opts.PeerDialOptions = []grpc.DialOption{grpc.WithInsecure()}
 	}
 
@@ -103,7 +111,7 @@ func NewGRPCOptions(self string, server *grpc.Server, opts *GRPCPoolOptions) *GR
 
 	pool.peers = consistenthash.New(pool.opts.Replicas, pool.opts.HashFn)
 	groupcache.RegisterPeerPicker(func() groupcache.PeerPicker { return pool })
-	// pb.RegisterGroupCacheServer(server, pool)
+	pb.RegisterGroupCacheServer(server, pool)
 	return pool
 
 }
@@ -123,7 +131,7 @@ func (gp *GRPCPool) PickPeer(key string) (groupcache.ProtoGetter, bool) {
 }
 
 // NOT SURE
-func (gp *GRPCPool) Retrieve(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+func (gp *GRPCPool) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	group := groupcache.GetGroup(req.Group)
 	if group == nil {
 		// log.Warnf("Unable to find group [%s]", req.Group)
@@ -146,14 +154,47 @@ func (gp *GRPCPool) Retrieve(ctx context.Context, req *pb.GetRequest) (*pb.GetRe
 func (g *grpcGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
 	client := pb.NewGroupCacheClient(g.conn)
 	resp, err := client.Get(context.Background(), &pb.GetRequest{
-		Group: *in.Group, 
-		Key: *in.Key})
+		Group: in.Group, 
+		Key: in.Key})	// passed with an empty Context
 	if err != nil {
 		return fmt.Errorf("Failed to GET [%s]: %v", in, err)
 	}
 
 	out.Value = resp.Value
 	return nil
+}
+
+// NOT SURE
+// SET: sets the peers for the given GRPCPool, can be specified or not (same as HTTPPool); also opens the RPC connections to all new peers
+func (gp *GRPCPool) Set(peers ...string) {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+	gp.peers = consistenthash.New(gp.opts.Replicas, gp.opts.HashFn)
+	tempGetters := make(map[string]*grpcGetter, len(peers))
+	for _, peer := range peers {
+		fmt.Printf("Peer Address: [%s]\n", peer)
+		if getter, exists := gp.grpcGetters[peer]; exists == true {
+			tempGetters[peer] = getter
+			gp.peers.Add(peer)
+			delete(gp.grpcGetters, peer)	// should be able to just set the new getter immediately, no? no need for tempGetters:
+			// gp.grpcGetters[peer] = getter
+		} else {
+			getter, err := newGRPCGetter(peer, gp.opts.PeerDialOptions...)
+			if err != nil {
+				// TODO: log it
+			} else {
+				tempGetters[peer] = getter
+				gp.peers.Add(peer)
+			}
+		}
+	}
+
+	for p, g := range gp.grpcGetters {
+		g.close()
+		delete(gp.grpcGetters, p)
+	}
+
+	gp.grpcGetters = tempGetters
 }
 
 // NOT SURE
